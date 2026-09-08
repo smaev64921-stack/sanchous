@@ -1,0 +1,17 @@
+# секреты — в репозиторий не попадают
+.env
+.env.*
+!.env.example
+*.token
+
+# служебное
+__pycache__/
+*.py[cod]
+.claude/
+.DS_Store
+Thumbs.db
+*.log
+
+# исходные файлы макета (не нужны сайту)
+5260243578280*.jpg
+.impeccable/
