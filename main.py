@@ -31,9 +31,52 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------- настройки
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN") or "").strip()
-PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("WEBAPP_URL") or "").strip().rstrip("/")
-PORT = int(os.environ.get("PORT") or os.environ.get("APP_PORT") or 8080)
+
+
+def _first_env(*names):
+    for n in names:
+        v = (os.environ.get(n) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _as_https(v):
+    """Адрес хостинга приходит по-разному: с https, без схемы, со слэшем."""
+    v = v.strip().rstrip("/")
+    if not v:
+        return ""
+    if v.startswith("http://") or v.startswith("https://"):
+        return v
+    return "https://" + v
+
+
+PUBLIC_URL = _as_https(_first_env(
+    "PUBLIC_URL", "WEBAPP_URL", "APP_URL", "SITE_URL", "DOMAIN", "RENDER_EXTERNAL_URL"))
 ADMIN_ID = (os.environ.get("ADMIN_ID") or "").strip()
+
+
+def _ports():
+    """Порты, на которых слушаем сайт.
+
+    Ловушка хостинга: системная переменная PORT перекрывает
+    пользовательскую, а обратный прокси всё равно стучится на 3000.
+    Процесс с живым сайтом на «своём» порту выглядит снаружи как 502.
+    Поэтому занимаем несколько портов сразу — какой-нибудь да совпадёт.
+    """
+    out = []
+    for v in (os.environ.get("PORT"), os.environ.get("APP_PORT"), "3000", "8080"):
+        try:
+            p = int(str(v).strip())
+        except (TypeError, ValueError):
+            continue
+        if 0 < p < 65536 and p not in out:
+            out.append(p)
+    return out or [8080]
+
+
+PORTS = _ports()
+PORT = PORTS[0]
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 API = "https://api.telegram.org/bot{}/{}".format(BOT_TOKEN, "{}")
@@ -91,18 +134,27 @@ class SiteHandler(SimpleHTTPRequestHandler):
         pass          # не засоряем вывод обращениями к статике
 
 
-def serve_site():
+def serve_on(port):
     ThreadingHTTPServer.allow_reuse_address = True
     try:
-        httpd = ThreadingHTTPServer(("0.0.0.0", PORT), SiteHandler)
+        httpd = ThreadingHTTPServer(("0.0.0.0", port), SiteHandler)
     except OSError as e:
-        log("!! не удалось занять порт {}: {}".format(PORT, e))
-        return
-    log("сайт поднят на порту {} (папка: {})".format(PORT, ROOT))
-    try:
-        httpd.serve_forever()
-    except Exception as e:
-        log("!! веб-сервер остановлен:", e)
+        log("порт {} занят или недоступен: {}".format(port, e))
+        return False
+    log("слушаю 0.0.0.0:{}".format(port))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return True
+
+
+def serve_site():
+    """Поднимаем сайт на всех портах из PORTS — хотя бы один совпадёт
+    с тем, куда ходит прокси хостинга."""
+    live = [p for p in PORTS if serve_on(p)]
+    if not live:
+        log("!! сайт не поднялся ни на одном порту из {}".format(PORTS))
+    else:
+        log("сайт раздаётся из папки {}".format(ROOT))
+    return live
 
 
 # ---------------------------------------------------------------- Telegram API
@@ -143,12 +195,21 @@ def site_url():
     return PUBLIC_URL or "http://localhost:{}".format(PORT)
 
 
+def mini_app_ok():
+    """Кнопка Mini App живёт только на https — таково требование Telegram."""
+    return site_url().startswith("https://")
+
+
 def start_keyboard():
+    """Первая кнопка — во всю ширину и открывает магазин прямо в Telegram.
+    Ссылкой на сайт подстраховываемся только тогда, когда Mini App
+    недоступен: две кнопки, ведущие в одно место, только путают."""
     url = site_url()
     rows = []
-    if url.startswith("https://"):
-        rows.append([{"text": "🛒 Открыть магазин", "web_app": {"url": url}}])
-    rows.append([{"text": "🌐 Сайт «{}»".format(SHOP_NAME), "url": url}])
+    if mini_app_ok():
+        rows.append([{"text": "🛒  Открыть магазин", "web_app": {"url": url}}])
+    else:
+        rows.append([{"text": "🌐  Открыть сайт", "url": url}])
     rows.append([
         {"text": "🔥 Каталог", "callback_data": "catalog"},
         {"text": "🚚 Доставка", "callback_data": "delivery"},
@@ -157,11 +218,14 @@ def start_keyboard():
 
 
 WELCOME = (
-    "<b>Соус есть? Санчоус.</b>\n\n"
-    "Вкус, который ты точно захочешь повторить 🔥\n\n"
-    "Открывай магазин прямо здесь — выбирай соусы, "
-    "добавляй в корзину и оформляй заказ в пару касаний.\n\n"
-    "🌐 Сайт: {url}"
+    "🌶 <b>САНЧОУС</b>\n"
+    "<i>Соус есть? Санчоус.</i>\n\n"
+    "Четыре соуса, которые хочется повторить:\n"
+    "🧀 Сырный · 🍅 Кетчуп\n"
+    "👑 Фирменный · 🌶 Медово-чили\n\n"
+    "От <b>99 ₽</b> · доставка по всей стране\n"
+    "Бесплатно от 1 500 ₽\n\n"
+    "Жмите кнопку ниже — соберём заказ в пару касаний 👇"
 )
 
 CATALOG = (
@@ -191,6 +255,22 @@ def send(chat_id, text, keyboard=None):
     return api("sendMessage", chat_id=chat_id, text=text,
                parse_mode="HTML", disable_web_page_preview=True,
                reply_markup=keyboard)
+
+
+def send_start(chat_id):
+    """Приветствие карточкой: баннер, текст под ним и кнопка магазина.
+
+    Картинку Telegram забирает по ссылке сам, поэтому она появляется
+    только когда сайт уже виден снаружи. Не получилось — отправляем
+    тем же текстом без картинки: человек всё равно получает кнопку.
+    """
+    if mini_app_ok():
+        photo = site_url() + "/img/banner-1400.jpg"
+        if api("sendPhoto", chat_id=chat_id, photo=photo,
+               caption=WELCOME, parse_mode="HTML",
+               reply_markup=start_keyboard()):
+            return
+    send(chat_id, WELCOME + "\n\n🌐 {}".format(site_url()), start_keyboard())
 
 
 def handle_order(chat_id, raw):
@@ -249,7 +329,7 @@ def handle_update(u):
     text = (msg.get("text") or "").strip().lower()
 
     if text.startswith("/start"):
-        send(chat_id, WELCOME.format(url=site_url()), start_keyboard())
+        send_start(chat_id)
     elif text.startswith("/shop") or text.startswith("/site") or "сайт" in text:
         send(chat_id, "Магазин «{}»: {}".format(SHOP_NAME, site_url()), start_keyboard())
     elif text.startswith("/catalog") or "каталог" in text:
@@ -286,8 +366,10 @@ def setup_bot():
         })
         log("кнопка меню ведёт на мини-приложение: {}".format(url))
     else:
-        log("PUBLIC_URL не задан или не https — кнопка Mini App отключена, "
-            "в сообщениях будет обычная ссылка: {}".format(url))
+        log("!! PUBLIC_URL не задан — магазин не откроется кнопкой внутри Telegram.")
+        log("!! Впишите в переменные окружения хостинга адрес сайта, например:")
+        log("!!   PUBLIC_URL=https://bot-XXXX.bothost.tech")
+        log("!! Пока в сообщениях будет обычная ссылка: {}".format(url))
     return True
 
 
@@ -311,7 +393,7 @@ def poll():
 
 
 def main():
-    threading.Thread(target=serve_site, daemon=True).start()
+    serve_site()
 
     if not BOT_TOKEN:
         log("!! BOT_TOKEN не задан — работает только сайт на порту {}".format(PORT))
